@@ -1,0 +1,239 @@
+const { 
+  generateContentStrategy, 
+  generateAudiencePersona,
+  generateContentIdeas,
+  generateExpandedContent
+} = require('../services/aiService');
+const ContentStrategy = require('../models/ContentStrategy');
+const { searchYouTubeByTopic } = require('../services/youtubeService');
+const { searchRedditByTopic } = require('../services/redditService');
+const { searchTwitterByTopic } = require('../services/twitterService');
+const { getOpenRouterGeneratedTrends } = require('../services/openRouterTrendsService');
+
+const generateIdeas = async (req, res) => {
+  const { topic, type } = req.body;
+  if (typeof topic !== 'string' || topic.trim().length < 1 || topic.length > 200 || typeof type !== 'string' || type.length > 50) {
+    return res.status(400).json({ success: false, error: 'Please provide a topic and idea type.' });
+  }
+  try {
+    const ideas = await generateContentIdeas(topic, type);
+    res.status(200).json({ success: true, data: ideas });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ success: false, error: 'Server Error: Could not generate ideas.' });
+  }
+};
+
+const generateStrategy = async (req, res) => {
+  const { targetAudience, topic, goals, startDate, endDate } = req.body;
+
+  if ([targetAudience, topic, goals].some(value => typeof value !== 'string' || value.trim().length < 1 || value.length > 2000)) {
+    return res.status(400).json({ success: false, error: 'Please provide targetAudience, topic, and goals' });
+  }
+
+  try {
+    console.log(`Generating persona for: ${targetAudience}`);
+    const audiencePersona = await generateAudiencePersona(targetAudience);
+    console.log('Generated Persona:', audiencePersona);
+
+    console.log(`Fetching trends for topic: ${topic}`);
+    const trendSources = await Promise.all([
+      searchYouTubeByTopic(topic),
+      searchRedditByTopic(topic),
+      searchTwitterByTopic(topic),
+      getOpenRouterGeneratedTrends(topic),
+    ]);
+    
+    const trendingKeywords = trendSources.flat().map(trend => trend.keyword).slice(0, 10);
+    console.log(`Found trending keywords:`, trendingKeywords);
+    
+    const generatedPlan = await generateContentStrategy(
+      audiencePersona,
+      topic, 
+      goals, 
+      trendingKeywords,
+      startDate,
+      endDate
+    );
+
+    const newStrategy = new ContentStrategy({
+      user: req.user.id,
+      targetAudience,
+      audiencePersona,
+      topic,
+      goals,
+      startDate: startDate || new Date(),
+      endDate: endDate || null,
+      generatedPlan,
+    });
+
+    const savedStrategy = await newStrategy.save();
+
+    res.status(201).json({ success: true, data: savedStrategy });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ success: false, error: 'Server Error: Could not generate strategy.' });
+  }
+};
+
+const getStrategies = async (req, res) => {
+  try {
+    const strategies = await ContentStrategy.find({ user: req.user.id }).sort({ createdAt: -1 });
+    res.status(200).json({ success: true, count: strategies.length, data: strategies });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ success: false, error: 'Server Error: Could not fetch strategies.' });
+  }
+};
+
+const getStrategyById = async (req, res) => {
+  try {
+    const strategy = await ContentStrategy.findOne({ _id: req.params.id, user: req.user.id });
+    if (!strategy) {
+      return res.status(404).json({ success: false, error: 'Strategy not found or you are not authorized to view it.' });
+    }
+    res.status(200).json({ success: true, data: strategy });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ success: false, error: 'Server Error: Could not fetch strategy.' });
+  }
+};
+
+const updateCalendarItem = async (req, res) => {
+  const { strategyId, day: originalDayStr } = req.params;
+  const { title, format, platform, postTime, status, rationale, day: newDay } = req.body;
+  const originalDay = parseInt(originalDayStr);
+
+  if (!Number.isInteger(originalDay) || originalDay < 1 || originalDay > 90) {
+    return res.status(400).json({ success: false, error: 'Invalid calendar day.' });
+  }
+  if (newDay !== undefined && (!Number.isInteger(Number(newDay)) || Number(newDay) < 1 || Number(newDay) > 90)) {
+    return res.status(400).json({ success: false, error: 'Invalid destination day.' });
+  }
+  if (status !== undefined && !['To Do', 'In Progress', 'Completed'].includes(status)) {
+    return res.status(400).json({ success: false, error: 'Invalid calendar status.' });
+  }
+  for (const [field, value] of Object.entries({ title, format, platform, postTime, rationale })) {
+    if (value !== undefined && (typeof value !== 'string' || value.length > 2000)) {
+      return res.status(400).json({ success: false, error: `Invalid ${field}.` });
+    }
+  }
+
+  try {
+    const strategy = await ContentStrategy.findOne({ _id: strategyId, user: req.user.id });
+    if (!strategy) {
+      return res.status(404).json({ success: false, error: 'Strategy not found.' });
+    }
+
+    const originalCalendar = strategy.generatedPlan.calendar;
+    const itemToMove = originalCalendar.find(item => item.day === originalDay);
+
+    if (!itemToMove) {
+      return res.status(404).json({ success: false, error: 'Calendar item for original day not found.' });
+    }
+
+    // --- START OF NEW, SAFER "MOVE AND OVERWRITE" LOGIC ---
+    if (newDay !== undefined && Number(newDay) !== originalDay) {
+      const destinationDay = Number(newDay);
+      
+      const newCalendar = [];
+      // Iterate over the original calendar to build the new one safely
+      for (const item of originalCalendar) {
+        // If the current item is the one we are dropping ONTO (the target), SKIP it.
+        if (item.day === destinationDay) {
+          continue; 
+        }
+        // If the current item is the one we are moving, update its day and add it.
+        if (item.day === originalDay) {
+          newCalendar.push({ ...item.toObject(), day: destinationDay });
+        }
+        // Otherwise, just add the item as is.
+        else {
+          newCalendar.push(item);
+        }
+      }
+      strategy.generatedPlan.calendar = newCalendar;
+    }
+    // --- END OF NEW LOGIC ---
+
+    // Standard Update (editing details without moving)
+    else {
+      const itemToUpdate = originalCalendar.find(item => item.day === originalDay);
+      if (title !== undefined) itemToUpdate.title = title;
+      if (format !== undefined) itemToUpdate.format = format;
+      if (platform !== undefined) itemToUpdate.platform = platform;
+      if (postTime !== undefined) itemToUpdate.postTime = postTime;
+      if (status !== undefined) itemToUpdate.status = status;
+      if (rationale !== undefined) itemToUpdate.rationale = rationale;
+    }
+
+    strategy.markModified('generatedPlan.calendar');
+    await strategy.save();
+
+    res.status(200).json({ success: true, data: strategy });
+
+  } catch (error) {
+    console.error('Error updating calendar item:', error);
+    res.status(500).json({ success: false, error: 'Server Error: Could not update calendar item.' });
+  }
+};
+
+
+const generatePersona = async (req, res) => {
+  const { audience } = req.body;
+  if (typeof audience !== 'string' || audience.trim().length < 1 || audience.length > 2000) {
+    return res.status(400).json({ success: false, error: 'Please provide audience keywords.' });
+  }
+  try {
+    const persona = await generateAudiencePersona(audience);
+    res.status(200).json({ success: true, data: persona });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ success: false, error: 'Server Error: Could not generate persona.' });
+  }
+};
+
+const deleteStrategy = async (req, res) => {
+  try {
+    const strategy = await ContentStrategy.findOne({
+      _id: req.params.id,
+      user: req.user.id,
+    });
+
+    if (!strategy) {
+      return res.status(404).json({ success: false, error: 'Strategy not found or you are not authorized to delete it.' });
+    }
+
+    await strategy.deleteOne();
+
+    res.status(200).json({ success: true, data: {} });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ success: false, error: 'Server Error: Could not delete strategy.' });
+  }
+};
+
+const expandIdea = async (req, res) => {
+  const { title, format } = req.body;
+  if (!title || !format) {
+    return res.status(400).json({ success: false, error: 'Please provide a title and format.' });
+  }
+  try {
+    const expandedContent = await generateExpandedContent(title, format);
+    res.status(200).json({ success: true, data: expandedContent });
+  } catch (error) {
+    console.error('Error in expandIdea controller:', error);
+    res.status(500).json({ success: false, error: 'Server Error' });
+  }
+};
+
+module.exports = {
+  generateStrategy,
+  getStrategies,
+  getStrategyById,
+  updateCalendarItem,
+  generatePersona,
+  deleteStrategy,
+  generateIdeas,
+  expandIdea,
+};

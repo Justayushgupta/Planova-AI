@@ -1,0 +1,17 @@
+@import "tailwindcss";
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+html, body, #root {
+  height: 100%;
+}
+/* Avoid using @apply for global body to prevent unknown utility errors in some PostCSS/Tailwind setups */
+body {
+  background-color: #f3f4f6; /* approximate of bg-gray-100 */
+  color: #1f2937; /* approximate of text-gray-800 */
+}
+.dark body {
+  background-color: #111827; /* dark bg */
+  color: #f9fafb; /* dark text */
+}
